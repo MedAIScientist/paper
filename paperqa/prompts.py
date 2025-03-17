@@ -1,14 +1,21 @@
 from datetime import datetime
 
 summary_prompt = (
-    "Summarize the excerpt below to help answer a question.\n\nExcerpt from"
-    " {citation}\n\n----\n\n{text}\n\n----\n\nQuestion: {question}\n\nDo not directly"
-    " answer the question, instead summarize to give evidence to help answer the"
-    " question. Stay detailed; report specific numbers, equations, or direct quotes"
-    ' (marked with quotation marks). Reply "Not applicable" if the excerpt is'
-    " irrelevant. At the end of your response, provide an integer score from 1-10 on a"
-    " newline indicating relevance to question. Do not explain your score.\n\nRelevant"
-    " Information Summary ({summary_length}):"
+    "Analyze and summarize the excerpt below to help answer a question.\n\n"
+    "Excerpt from {citation}\n\n----\n\n{text}\n\n----\n\n"
+    "Question: {question}\n\n"
+    "Follow these guidelines:\n"
+    "1. Do not directly answer the question\n"
+    "2. Instead, provide a structured analysis of evidence that helps answer the question\n"
+    "3. Stay detailed and specific; include:\n"
+    "   - Key numerical results and statistics\n"
+    "   - Relevant equations\n"
+    "   - Direct quotes (marked with quotation marks)\n"
+    "   - Methodological details if relevant\n"
+    '4. Reply "Not applicable" if the excerpt is irrelevant\n'
+    "5. Assess and explain any limitations or potential biases in the evidence\n"
+    "6. On a new line, provide a relevance score (1-10) without explanation\n\n"
+    "Relevant Information Summary ({summary_length}):"
 )
 
 summary_json_prompt = (
@@ -20,21 +27,22 @@ summary_json_prompt = (
 # 2. Can be used for unit testing
 CANNOT_ANSWER_PHRASE = "I cannot answer"
 qa_prompt = (
-    "Answer the question below with the context.\n\n"
+    "Provide a comprehensive scientific analysis of the question below using the provided context.\n\n"
     "Context (with relevance scores):\n\n{context}\n\n----\n\n"
     "Question: {question}\n\n"
-    "Write an answer based on the context. "
-    "If the context provides insufficient information reply "
-    f'"{CANNOT_ANSWER_PHRASE}." '
-    "For each part of your answer, indicate which sources most support "
-    "it via citation keys at the end of sentences, "
-    "like {example_citation}. Only cite from the context "
-    "below and only use the valid keys. Write in the style of a "
-    "Wikipedia article, with concise sentences and coherent paragraphs. "
-    "The context comes from a variety of sources and is only a summary, "
-    "so there may inaccuracies or ambiguities. If quotes are present and "
-    "relevant, use them in the answer. This answer will go directly onto "
-    "Wikipedia, so do not add any extraneous information.\n\n"
+    "Guidelines:\n"
+    "1. Structure your response like a scientific paper section\n"
+    "2. Base your answer strictly on the provided context\n"
+    f'3. If insufficient evidence exists, state "{CANNOT_ANSWER_PHRASE}"\n'
+    "4. Cite sources using citation keys at the end of sentences like {example_citation}\n"
+    "5. Only use citation keys from the valid keys provided\n"
+    "6. Write in a formal academic style with:\n"
+    "   - Clear topic sentences\n"
+    "   - Logical paragraph structure\n"
+    "   - Evidence-based argumentation\n"
+    "7. Address potential limitations or contradictions in the evidence\n"
+    "8. Include relevant quotes when they strengthen the argument\n"
+    "9. Do not add extraneous information beyond the context because this answer will be used in a Wikipedia article\n\n"
     "Answer ({answer_length}):"
 )
 
@@ -66,10 +74,13 @@ structured_citation_prompt = (
     "Citation JSON:"
 )
 
+# Enhanced system prompts
 default_system_prompt = (
-    "Answer in a direct and concise tone. "
-    "Your audience is an expert, so be highly specific. "
-    "If there are ambiguous terms or acronyms, first define them."
+    "You are a helpful scientist. "
+    "Answer in a direct, concise, and scientifically rigorous tone. "
+    "Your audience consists of experts, so be highly specific and technical. "
+    "Define any ambiguous terms or acronyms first. "
+    "Think step by step and provide evidence-based responses."
 )
 
 # NOTE: we use double curly braces here so it's not considered an f-string template
