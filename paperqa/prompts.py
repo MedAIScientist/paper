@@ -1,5 +1,7 @@
 from datetime import datetime
 
+# ruff: noqa: E501
+
 summary_prompt = (
     "Summarize the excerpt below to help answer a question.\n\nExcerpt from"
     " {citation}\n\n----\n\n{text}\n\n----\n\nQuestion: {question}\n\nDo not directly"
@@ -19,6 +21,15 @@ summary_json_prompt = (
 # 1. Lead to complete tool being called with has_successful_answer=False
 # 2. Can be used for unit testing
 CANNOT_ANSWER_PHRASE = "I cannot answer"
+
+answer_iteration_prompt_template = (
+    "You are iterating on a prior answer, with a potentially different context:\n\n"
+    "{prior_answer}\n\n"
+    "Create a new answer only using keys and data from the included context."
+    " You can not use context keys from the prior answer which are not "
+    "also included in the above context.\n\n"
+)
+
 qa_prompt = (
     "Answer the question below with the context.\n\n"
     "Context (with relevance scores):\n\n{context}\n\n----\n\n"
@@ -35,6 +46,7 @@ qa_prompt = (
     "so there may inaccuracies or ambiguities. If quotes are present and "
     "relevant, use them in the answer. This answer will go directly onto "
     "Wikipedia, so do not add any extraneous information.\n\n"
+    "{prior_answer_prompt}"
     "Answer ({answer_length}):"
 )
 
@@ -82,7 +94,7 @@ Provide a summary of the relevant information that could help answer the questio
 }}
 
 where `summary` is relevant information from the text - {summary_length} words. `relevance_score` is an integer 1-10 for the relevance of `summary` to the question.
-"""  # noqa: E501
+"""
 
 env_system_prompt = (
     # Matching https://github.com/langchain-ai/langchain/blob/langchain%3D%3D0.2.3/libs/langchain/langchain/agents/openai_functions_agent/base.py#L213-L215

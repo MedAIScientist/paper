@@ -539,7 +539,29 @@ def test_location_awareness(docs_fixture) -> None:
 
 
 def test_query(docs_fixture) -> None:
-    docs_fixture.query("Is XAI usable in chemistry?")
+    settings = Settings(prompts={"answer_iteration_prompt": None})
+    docs_fixture.query("Is XAI usable in chemistry?", settings=settings)
+
+
+def test_query_with_iteration(docs_fixture) -> None:
+    # we store these results to check that the prompts are OK
+    my_results: list[LLMResult] = []
+    # explicitly set the prompt to use QA iterations
+    settings = Settings()
+    llm = settings.get_llm()
+    llm.llm_result_callback = my_results.append
+    prior_answer = "No, it isn't usable in chemistry."
+    question = "Is XAI usable in chemistry?"
+    prior_session = PQASession(question=question, answer=prior_answer)
+    docs_fixture.query(prior_session, llm_model=llm, settings=settings)
+    assert prior_answer in cast(
+        "str", my_results[-1].prompt[1].content  # type: ignore[union-attr, index]
+    ), "prior answer not in prompt"
+    # run without a prior session to check that the flow works correctly
+    docs_fixture.query(question, llm_model=llm, settings=settings)
+    assert settings.prompts.answer_iteration_prompt[:10] not in cast(  # type: ignore[index]
+        "str", my_results[-1].prompt[1].content  # type: ignore[union-attr, index]
+    ), "prior answer prompt should not be inserted"
 
 
 def test_llmresult_callback(docs_fixture: Docs) -> None:
@@ -555,6 +577,41 @@ def test_llmresult_callback(docs_fixture: Docs) -> None:
     assert len(my_results) >= 1, "Expected the callback to append results"
     assert my_results[0].name
     assert my_results[0].session_id
+
+
+@pytest.mark.parametrize(
+    ("llm", "llm_settings"),
+    [
+        pytest.param(
+            "deepseek/deepseek-reasoner",
+            {
+                "model_list": [
+                    {
+                        "model_name": "deepseek/deepseek-reasoner",
+                        "litellm_params": {
+                            "model": "deepseek/deepseek-reasoner",
+                            "api_base": "https://api.deepseek.com/v1",
+                        },
+                    }
+                ]
+            },
+            id="deepseek-reasoner",
+        ),
+        pytest.param(
+            "openrouter/deepseek/deepseek-r1",
+            {},
+            id="openrouter-deepseek",
+        ),
+    ],
+)
+@pytest.mark.vcr(match_on=[*VCR_DEFAULT_MATCH_ON, "body"])
+def test_get_reasoning(docs_fixture: Docs, llm: str, llm_settings: dict) -> None:
+    settings = Settings(
+        llm=llm,
+        llm_settings=llm_settings,
+    )
+    response = docs_fixture.query("What is XAI?", settings=settings)
+    assert response.answer_reasoning
 
 
 def test_duplicate(stub_data_dir: Path) -> None:
@@ -714,7 +771,7 @@ def test_hybrid_embedding(stub_data_dir: Path, vector_store: type[VectorStore]) 
 
 def test_custom_llm(stub_data_dir: Path) -> None:
     class StubLLMModel(LLMModel):
-        name: str = "myllm"
+        name: str = "custom/myllm"
 
         async def acompletion(
             self, messages: list[Message], **kwargs  # noqa: ARG002
@@ -911,7 +968,8 @@ async def test_partly_embedded_texts(defer_embeddings: bool) -> None:
     assert len(docs.texts_index.texts_hashes) == len(texts_to_add)
 
 
-# some of the stored requests will be identical on method, scheme, host, port, path, and query (if defined)
+# some of the stored requests will be identical on
+# method, scheme, host, port, path, and query (if defined)
 # body will always be different between requests
 # adding body so that vcr correctly match the right request with its response.
 @pytest.mark.vcr(match_on=[*VCR_DEFAULT_MATCH_ON, "body"])
@@ -1384,7 +1442,7 @@ async def test_partitioning_fn_docs(use_partition: bool) -> None:
     await docs._build_texts_index(settings.get_embedding_model())
 
     partitioned_texts, _ = cast(
-        tuple[Sequence[Text], list[float]],
+        "tuple[Sequence[Text], list[float]]",
         await docs.texts_index.partitioned_similarity_search(
             "What do I like?",
             k=4,
@@ -1394,7 +1452,7 @@ async def test_partitioning_fn_docs(use_partition: bool) -> None:
     )
 
     default_texts, _ = cast(
-        tuple[Sequence[Text], list[float]],
+        "tuple[Sequence[Text], list[float]]",
         await docs.texts_index.similarity_search(
             "What do I like?", k=4, embedding_model=settings.get_embedding_model()
         ),
@@ -1472,6 +1530,12 @@ class TestLLMParseJson:
                 "Hope this helps!",
                 id="removing-intro-outro-text",
             ),
+            pytest.param(
+                "I am here to help"
+                '{\n   "summary": "Lorem Ipsum",\n   "relevance_score": "8" \n}'
+                "Hope this helps!",
+                id="with-newlines-and-quotes",
+            ),
         ],
     )
     def test_basic_json_extraction(self, input_text: str) -> None:
@@ -1482,10 +1546,8 @@ class TestLLMParseJson:
         "input_text",
         [
             pytest.param(
-                "<think> Thinking </think>"
-                "\n I am here to help\n\n"
-                '{\n"summary": "Lorem Ipsum\n\ndolor sit amet",\n"relevance_score": 8\n}'
-                "\nHope this helps!",
+                '<think> Thinking </think>\n I am here to help\n\n{\n"summary": "Lorem'
+                ' Ipsum\n\ndolor sit amet",\n"relevance_score": 8\n}\nHope this helps!',
                 id="handling-newlines-in-json-values",
             ),
         ],
@@ -1512,10 +1574,8 @@ class TestLLMParseJson:
                 id="string-relevance-score",
             ),
             pytest.param(
-                "<think> Thinking </think>"
-                "I am here to help"
-                '```json {   "summary": "Lorem Ipsum",   "relevance_score": "8/10" } ```'
-                "Hope this helps!",
+                '<think> Thinking </think>I am here to help```json {   "summary":'
+                ' "Lorem Ipsum",   "relevance_score": "8/10" } ```Hope this helps!',
                 id="string-relevance-score-fraction-1",
             ),
             pytest.param(
@@ -1623,7 +1683,7 @@ class TestLLMParseJson:
         "input_text",
         [
             pytest.param(
-                "<think> Thinking </think>" "Lorem Ipsum. Hope this helps!",
+                "<think> Thinking </think>Lorem Ipsum. Hope this helps!",
                 id="non-json-string-with-think-tags",
             ),
             pytest.param(
@@ -1645,6 +1705,25 @@ class TestLLMParseJson:
     )
     def test_llm_parse_json_with_escaped_characters(self, input_text, expected_output):
         assert llm_parse_json(input_text) == expected_output
+
+    @pytest.mark.parametrize(
+        "input_text",
+        [
+            pytest.param(
+                '{\n  "summary": "An excerpt with "quoted stuff" or "maybe more." More'
+                ' stuff (with parenthesis).",\n  "relevance_score": "8"\n}'
+            ),
+        ],
+    )
+    def test_llm_subquotes_and_newlines(self, input_text: str) -> None:
+        output = {
+            "summary": (
+                'An excerpt with "quoted stuff" or "maybe more." More stuff (with'
+                " parenthesis)."
+            ),
+            "relevance_score": 8,
+        }
+        assert llm_parse_json(input_text) == output
 
 
 def test_maybe_get_date():
