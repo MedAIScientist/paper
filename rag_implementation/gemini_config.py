@@ -51,7 +51,6 @@ import os
 import json
 from paperqa import Settings, ask
 from paperqa.settings import AgentSettings
-
 # Disable OpenAI by removing its API key from environment
 # if "OPENAI_API_KEY" in os.environ:
 #     del os.environ["OPENAI_API_KEY"]
