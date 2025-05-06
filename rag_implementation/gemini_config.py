@@ -53,11 +53,11 @@ from paperqa import Settings, ask
 from paperqa.settings import AgentSettings
 
 # Disable OpenAI by removing its API key from environment
-if "OPENAI_API_KEY" in os.environ:
-    del os.environ["OPENAI_API_KEY"]
-
-# Add a mock OpenAI key that will cause errors if somehow OpenAI is still attempted
-os.environ["OPENAI_API_KEY"] = "INVALID_KEY_TO_PREVENT_OPENAI_USAGE"
+# if "OPENAI_API_KEY" in os.environ:
+#     del os.environ["OPENAI_API_KEY"]
+#
+# # Add a mock OpenAI key that will cause errors if somehow OpenAI is still attempted
+# os.environ["OPENAI_API_KEY"] = "INVALID_KEY_TO_PREVENT_OPENAI_USAGE"
 
 # Configure Gemini API key in LiteLLM config
 gemini_config = {
