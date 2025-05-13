@@ -1,11 +1,12 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import os
 import uvicorn
 import asyncio
 import concurrent.futures
 import json
+from pydantic import BaseModel
 
 # Import these from your main module
 from paperqa import Settings, ask
@@ -28,7 +29,7 @@ gemini_config = {
     "api_key": "AIzaSyBROcivtx7bzp2bbdU-x8ZJz6H8GhCaEkM",
     "model_list": [
         {
-            "model_name": "gemini/ggemini-2.5-flash-preview-04-17",
+            "model_name": "gemini/gemini-2.5-flash-preview-04-17",
             "litellm_params": {
                 "model": "gemini/gemini-2.5-flash-preview-04-17",
                 "api_key": "AIzaSyBROcivtx7bzp2bbdU-x8ZJz6H8GhCaEkM"
@@ -53,6 +54,23 @@ ollama_config = {
 # Create a thread pool executor
 executor = concurrent.futures.ThreadPoolExecutor()
 
+# Pydantic models for request/response
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]
+    model: str
+    stream: bool = False
+
+class ChatResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: List[Dict[str, Any]]
+    usage: Dict[str, int]
 
 def extract_answer_from_response(response_obj):
     """
@@ -98,7 +116,6 @@ def extract_answer_from_response(response_obj):
     except Exception as e:
         return f"Error extracting answer: {str(e)}"
 
-
 def run_ask_function(query: str) -> Dict[str, Any]:
     """
     Run the ask function in a separate thread and return the result.
@@ -136,7 +153,6 @@ def run_ask_function(query: str) -> Dict[str, Any]:
         import traceback
         return {"error": str(e), "traceback": traceback.format_exc()}
 
-
 @app.get("/ask")
 async def ask_question(q: str = Query(..., description="The question to ask")):
     """
@@ -145,9 +161,72 @@ async def ask_question(q: str = Query(..., description="The question to ask")):
     # Submit the task to the thread pool
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(executor, run_ask_function, q)
-
     return result
 
+@app.post("/v1/chat/completions")
+async def chat_completions(request: ChatRequest):
+    """
+    Endpoint for OpenWebUI chat completions
+    """
+    try:
+        # Extract the last user message
+        user_messages = [msg for msg in request.messages if msg.role == "user"]
+        if not user_messages:
+            raise HTTPException(status_code=400, detail="No user message found")
+        
+        last_user_message = user_messages[-1].content
+        
+        # Run the ask function
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(executor, run_ask_function, last_user_message)
+        
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        
+        # Format response for OpenWebUI 
+        return {
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": int(asyncio.get_event_loop().time()),
+            "model": request.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": str(result["answer"])
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/v1/models")
+async def list_models():
+    """
+    Endpoint to list available models for OpenWebUI
+    """
+    return {
+        "data": [
+            {
+                "id": "gemini/gemini-2.5-flash-preview-04-17",
+                "object": "model",
+                "created": 1677610602,
+                "owned_by": "google"
+            }
+        ],
+        "object": "list"
+    }
 
 if __name__ == "__main__":
     uvicorn.run("gemini_config_api:app", host="0.0.0.0", port=5555, reload=True)
+
+#ollama serve  
