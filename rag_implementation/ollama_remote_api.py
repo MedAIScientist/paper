@@ -382,7 +382,7 @@ def run_ask_function(query: str) -> Dict[str, Any]:
             ),
             embedding="ollama/mxbai-embed-large",
             embedding_config=ollama_config,
-            verbosity=0
+            verbosity=3
         )
 
         # Process the query
