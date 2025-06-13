@@ -21,7 +21,9 @@ Install the dependencies:
 pip install streamlit paper-qa
 ```
 
-Set your LLM API key (e.g. `OPENAI_API_KEY`) before running the app.
+You need an LLM API key (e.g. `OPENAI_API_KEY`).
+You can either export it before running the app or enter it in the UI
+sidebar after launch.
 
 ## Usage
 

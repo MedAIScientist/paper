@@ -1,4 +1,5 @@
 import asyncio
+import os
 from pathlib import Path
 
 import streamlit as st
@@ -8,6 +9,13 @@ st.title("ArcheoRAG")
 
 if "docs" not in st.session_state:
     st.session_state.docs = Docs(name="archeorag")
+
+st.sidebar.header("LLM API")
+api_key = st.sidebar.text_input("OpenAI API key", type="password")
+if st.sidebar.button("Save key") and api_key:
+    os.environ["OPENAI_API_KEY"] = api_key
+    st.session_state["api_key"] = api_key
+    st.sidebar.success("API key saved in session")
 
 setting_name = st.selectbox(
     "Settings profile",
