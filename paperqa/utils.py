@@ -20,7 +20,6 @@ from uuid import UUID
 
 import aiohttp
 import httpx
-import pymupdf
 from lmi import configure_llm_logs
 from pybtex.database import Person, parse_string
 from pybtex.database.input.bibtex import Parser
@@ -96,11 +95,6 @@ def strings_similarity(s1: str, s2: str, case_insensitive: bool = True) -> float
     return len(ss1.intersection(ss2)) / len(ss1.union(ss2))
 
 
-def count_pdf_pages(file_path: str | os.PathLike) -> int:
-    with pymupdf.open(file_path) as doc:
-        return len(doc)
-
-
 def hexdigest(data: str | bytes) -> str:
     if isinstance(data, str):
         return hashlib.md5(data.encode("utf-8")).hexdigest()  # noqa: S324
@@ -126,7 +120,7 @@ def extract_score(text: str) -> int:
     """
     # Check for N/A, not applicable, not relevant.
     # Don't check for NA, as there can be genes containing "NA"
-    last_line = text.split("\n")[-1]
+    last_line = text.rsplit("\n", maxsplit=1)[-1]
     if (
         "n/a" in last_line.lower()
         or "not applicable" in text.lower()
@@ -156,24 +150,8 @@ def extract_score(text: str) -> int:
     return 5
 
 
-def get_citenames(text: str) -> set[str]:
-    # Combined regex for identifying citations (see unit tests for examples)
-    citation_regex = r"\b[\w\-]+\set\sal\.\s\([0-9]{4}\)|\((?:[^\)]*?[a-zA-Z][^\)]*?[0-9]{4}[^\)]*?)\)"
-    results = re.findall(citation_regex, text, flags=re.MULTILINE)
-    # now find None patterns
-    none_citation_regex = r"(\(None[a-f]{0,1} pages [0-9]{1,10}-[0-9]{1,10}\))"
-    none_results = re.findall(none_citation_regex, text, flags=re.MULTILINE)
-    results.extend(none_results)
-    values = []
-    for citation in results:
-        citation = citation.strip("() ")
-        for c in re.split(r",|;", citation):
-            if c == "Extra background information":
-                continue
-            # remove leading/trailing spaces
-            c = c.strip()
-            values.append(c)
-    return set(values)
+def get_citation_ids(text: str) -> set[str]:
+    return set(re.findall(r"\bpqac-[a-zA-Z0-9]{8}\b", text))
 
 
 def extract_doi(reference: str) -> str:
@@ -478,10 +456,16 @@ def pqa_directory(name: str) -> Path:
 
 def setup_default_logs() -> None:
     """Configure logs to reasonable defaults."""
-    # Trigger PyMuPDF to use Python logging
-    # SEE: https://pymupdf.readthedocs.io/en/latest/app3.html#diagnostics
-    pymupdf.set_messages(pylogging=True)
     configure_llm_logs()
+    logging.config.dictConfig(
+        {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "loggers": {
+                "openai._base_client": {"level": "WARNING"}  # For OpenAI POSTs
+            },
+        }
+    )
 
 
 def extract_thought(content: str | None) -> str:
@@ -589,3 +573,20 @@ def maybe_get_date(date: str | datetime | None) -> datetime | None:
                 continue
         return None
     return date
+
+
+def clean_possessives(text: str) -> str:
+    """Remove possessive apostrophes from text (e.g. "X's Y" to "Xs Y")."""
+    # Handle apostrophes after word characters
+    # (possessive 's or trailing apostrophes)
+    text = re.sub(
+        r"(?<=\w)'(?:s\b|(?=\s|$))",
+        lambda m: "s" if m.group().endswith("s") else "",
+        text,
+    )
+    # Remove standalone 's patterns
+    text = re.sub(r"\s+'s\b", "", text)
+    text = re.sub(r"^'s\s*", "", text)
+    # Remove standalone apostrophes
+    text = re.sub(r"\s+'\s+", " ", text)
+    return re.sub(r"(?<!\w)'\s*", "", text)

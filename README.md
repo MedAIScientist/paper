@@ -760,7 +760,8 @@ The paper directory is not modified in any way, it's just read from.
 The indexing process attempts to infer paper metadata like title and DOI
 using LLM-powered text processing.
 You can avoid this point of uncertainty using a "manifest" file,
-which is a CSV containing three columns (order doesn't matter):
+which is a CSV containing `DocDetails` fields (order doesn't matter).
+For example:
 
 - `file_location`: relative path to the paper's PDF within the index directory
 - `doi`: DOI of the paper
@@ -768,6 +769,9 @@ which is a CSV containing three columns (order doesn't matter):
 
 By providing this information,
 we ensure queries to metadata providers like Crossref are accurate.
+
+To ease creating a manifest, there is a helper class method `Doc.to_csv`,
+which also works when called on `DocDetails`.
 
 ### Reusing Index
 
@@ -888,6 +892,8 @@ will return much faster than the first query and we'll be certain the authors ma
 | `parsing.use_doc_details`                    | `True`                                 | Whether to get metadata details for docs.                                                               |
 | `parsing.overlap`                            | `250`                                  | Characters to overlap chunks.                                                                           |
 | `parsing.defer_embedding`                    | `False`                                | Whether to defer embedding until summarization.                                                         |
+| `parsing.parse_pdf`                          | `parse_pdf_to_pages`                   | Function to parse PDF files.                                                                            |
+| `parsing.configure_pdf_parser`               | `setup_pymupdf_python_logging`         | Callable to configure the PDF parser within `parse_pdf`, useful for behaviors such as enabling logging. |
 | `parsing.chunking_algorithm`                 | `ChunkingOptions.SIMPLE_OVERLAP`       | Algorithm for chunking.                                                                                 |
 | `parsing.doc_filters`                        | `None`                                 | Optional filters for allowed documents.                                                                 |
 | `parsing.use_human_readable_clinical_trials` | `False`                                | Parse clinical trial JSONs into readable text.                                                          |
@@ -968,7 +974,7 @@ from paperqa import Docs, Settings
 my_qa_prompt = (
     "Answer the question '{question}'\n"
     "Use the context below if helpful. "
-    "You can cite the context using the key like (Example2012). "
+    "You can cite the context using the key like (pqac-abcd1234). "
     "If there is insufficient context, write a poem "
     "about how you cannot answer.\n\n"
     "Context: {context}"

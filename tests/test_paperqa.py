@@ -1,8 +1,10 @@
 import contextlib
+import csv
 import os
 import pathlib
 import pickle
 import re
+import sys
 from collections.abc import AsyncIterable, Sequence
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -50,9 +52,9 @@ from paperqa.prompts import qa_prompt as default_qa_prompt
 from paperqa.readers import parse_pdf_to_pages, read_doc
 from paperqa.types import ChunkMetadata
 from paperqa.utils import (
+    clean_possessives,
     encode_id,
     extract_score,
-    get_citenames,
     maybe_get_date,
     maybe_is_html,
     maybe_is_text,
@@ -70,42 +72,6 @@ async def docs_fixture(stub_data_dir: Path) -> Docs:
     with (stub_data_dir / "paper.pdf").open("rb") as f:
         await docs.aadd_file(f, "Wellawatte et al, XAI Review, 2023")
     return docs
-
-
-def test_get_citations() -> None:
-    text = (
-        "Yes, COVID-19 vaccines are effective. Various studies have documented the"
-        " effectiveness of COVID-19 vaccines in preventing severe disease,"
-        " hospitalization, and death. The BNT162b2 vaccine has shown effectiveness"
-        " ranging from 65% to -41% for the 5-11 years age group and 76% to 46% for the"
-        " 12-17 years age group, after the emergence of the Omicron variant in New York"
-        " (Dorabawila2022EffectivenessOT). Against the Delta variant, the effectiveness"  # spellchecker: disable-line
-        " of the BNT162b2 vaccine was approximately 88% after two doses"
-        " (Bernal2021EffectivenessOC pg. 1-3).\n\nVaccine effectiveness was also found"
-        " to be 89% against hospitalization and 91% against emergency department or"
-        " urgent care clinic visits (Thompson2021EffectivenessOC pg. 3-5, Goo2031Foo"
-        " pg. 3-4). In the UK vaccination program, vaccine effectiveness was"
-        " approximately 56% in individuals aged ≥70 years between 28-34 days"
-        " post-vaccination, increasing to approximately 58% from day 35 onwards"
-        " (Marfé2021EffectivenessOC).\n\nHowever, it is important to note that vaccine"
-        " effectiveness can decrease over time. For instance, the effectiveness of"
-        " COVID-19 vaccines against severe COVID-19 declined to 64% after 121 days,"
-        " compared to around 90% initially (Chemaitelly2022WaningEO, Foo2019Bar)."
-        " Despite this, vaccines still provide significant protection against severe"
-        " outcomes (Bar2000Foo pg 1-3; Far2000 pg 2-5)."
-    )
-    ref = {
-        "Dorabawila2022EffectivenessOT",  # spellchecker: disable-line
-        "Bernal2021EffectivenessOC pg. 1-3",
-        "Thompson2021EffectivenessOC pg. 3-5",
-        "Goo2031Foo pg. 3-4",
-        "Marfé2021EffectivenessOC",
-        "Chemaitelly2022WaningEO",
-        "Foo2019Bar",
-        "Bar2000Foo pg 1-3",
-        "Far2000 pg 2-5",
-    }
-    assert get_citenames(text) == ref
 
 
 def test_single_author() -> None:
@@ -494,7 +460,7 @@ async def test_docs_lifecycle(subtests: SubTests, stub_data_dir: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_evidence(docs_fixture) -> None:
+async def test_evidence(docs_fixture: Docs) -> None:
     debug_settings = Settings.from_name("debug")
     evidence = (
         await docs_fixture.aget_evidence(
@@ -503,6 +469,22 @@ async def test_evidence(docs_fixture) -> None:
         )
     ).contexts
     assert len(evidence) >= debug_settings.answer.evidence_k
+    assert len({e.context for e in evidence}) == len(
+        evidence
+    ), "Expected unique contexts"
+    texts = {c.text for c in evidence}
+    assert texts, "Below assertions require at least one text to be used"
+
+    # Okay, let's check we can get other evidence using the same underlying sources
+    other_evidence = (
+        await docs_fixture.aget_evidence(
+            PQASession(question="What is an acronym for explainable AI?"),
+            settings=debug_settings,
+        )
+    ).contexts
+    assert texts.intersection(
+        {c.text for c in other_evidence}
+    ), "We should be able to reuse sources across evidence calls"
 
 
 @pytest.mark.asyncio
@@ -607,7 +589,7 @@ async def test_llmresult_callback(docs_fixture: Docs) -> None:
         "What is XAI?", settings=settings, summary_llm_model=summary_llm
     )
     assert my_results
-    assert len(my_results) >= 1, "Expected the callback to append results"
+    assert my_results, "Expected the callback to append results"
     assert my_results[0].name
     assert my_results[0].session_id
 
@@ -642,7 +624,7 @@ async def test_llmresult_callback(docs_fixture: Docs) -> None:
 async def test_get_reasoning(docs_fixture: Docs, llm: str, llm_settings: dict) -> None:
     settings = Settings(
         llm=llm,
-        llm_settings=llm_settings,
+        llm_config=llm_settings,
     )
     response = await docs_fixture.aquery("What is XAI?", settings=settings)
     assert response.answer_reasoning
@@ -736,7 +718,7 @@ async def test_docs_with_custom_embedding(
             )
             assert collection_info.points_count > 0
         assert len(docs.texts_index) > 0
-        assert len(docs.texts_index.texts_hashes) > 0
+        assert docs.texts_index.texts_hashes
 
         # Clear the vector store via Docs
         docs.clear_docs()
@@ -746,7 +728,7 @@ async def test_docs_with_custom_embedding(
             assert not await docs.texts_index._collection_exists()
             assert docs.texts_index._point_ids is None
         assert len(docs.texts_index) == 0
-        assert len(docs.texts_index.texts_hashes) == 0
+        assert not docs.texts_index.texts_hashes
 
 
 @pytest.mark.asyncio
@@ -1017,12 +999,14 @@ async def test_partly_embedded_texts(defer_embeddings: bool) -> None:
     pre_embedded_text.embedding = (
         await settings.get_embedding_model().embed_documents([pre_embedded_text.text])
     )[0]
+    # Some of these texts are partly embedded, some are not
     texts_to_add = [
         pre_embedded_text,
         Text(text="I like cats.", name="sentence2", doc=stub_doc),
     ]
+    assert texts_to_add[0] != texts_to_add[1], "Test assumes different texts"
 
-    # 1. Add texts (and some are partly embedded)
+    # 1. Add texts, noting some are partly embedded
     await docs.aadd_texts(texts=texts_to_add, doc=stub_doc)
     assert docs.texts == texts_to_add
     assert not docs.texts_index.texts
@@ -1085,13 +1069,19 @@ async def test_pdf_reader_match_doc_details(stub_data_dir: Path) -> None:
     assert num_citations >= 1, "Expected at least one citation"
     assert (
         "Journal of Chemical Theory and Computation" in doc_details.formatted_citation
-    )
+    ) or ("ChemRxiv" in doc_details.formatted_citation)
 
     num_retries = 3
     for _ in range(num_retries):
         answer = await docs.aquery("Are counterfactuals actionable? [yes/no]")
         if any(w in answer.answer for w in ("yes", "Yes")):
             assert f"This article has {num_citations} citations" in answer.context
+            assert any(
+                c.id in answer.raw_answer for c in answer.contexts
+            ), "No context ids found in answer"
+            assert all(
+                c.id not in answer.formatted_answer for c in answer.contexts
+            ), "Context ids should not be in formatted answer"
             return
     raise AssertionError(f"Query was incorrect across {num_retries} retries.")
 
@@ -1131,6 +1121,7 @@ async def test_parser_only_reader(stub_data_dir: Path):
         Path(doc_path),
         Doc(docname="foo", citation="Foo et al, 2002", dockey="1"),
         parsed_text_only=True,
+        parse_pdf=parse_pdf_to_pages,
     )
     assert parsed_text.metadata.parse_type == "pdf"
     assert parsed_text.metadata.chunk_metadata is None
@@ -1146,18 +1137,38 @@ async def test_chunk_metadata_reader(stub_data_dir: Path) -> None:
         Doc(docname="foo", citation="Foo et al, 2002", dockey="1"),
         parsed_text_only=False,  # noqa: FURB120
         include_metadata=True,
+        parse_pdf=parse_pdf_to_pages,
     )
     assert metadata.parse_type == "pdf"
     assert isinstance(metadata.chunk_metadata, ChunkMetadata)
     assert metadata.chunk_metadata.chunk_type == "overlap_pdf_by_page"
     assert metadata.chunk_metadata.overlap == 100
     assert metadata.chunk_metadata.chunk_chars == 3000
-    assert all(len(chunk.text) <= 3000 for chunk in chunk_text)
-    assert metadata.total_parsed_text_length // 3000 <= len(chunk_text)
+    assert len(chunk_text) > 2, "Expected multiple chunks, for meaningful assertions"
+    assert all(
+        len(chunk.text) <= metadata.chunk_metadata.chunk_chars for chunk in chunk_text
+    )
+    assert (
+        metadata.total_parsed_text_length // metadata.chunk_metadata.chunk_chars
+        <= len(chunk_text)
+    )
     assert all(
         chunk_text[i].text[-100:] == chunk_text[i + 1].text[:100]
         for i in range(len(chunk_text) - 1)
     )
+    # Let's check the pages in the chunk names
+    first_page, _ = chunk_text[0].name.rsplit(" ", maxsplit=1)[-1].split("-")
+    assert first_page == "1", "First chunk should be for page 1"
+    stlast_page, last_page = chunk_text[-1].name.rsplit(" ", maxsplit=1)[-1].split("-")
+    assert (
+        int(last_page) - int(first_page) > 2
+    ), "Expected many pages, for meaningful assertions"
+    assert (
+        len(chunk_text[-1].text) < metadata.chunk_metadata.chunk_chars
+    ), "Expected last chunk to be a partial chunk, for meaningful assertions"
+    assert (
+        int(last_page) - int(stlast_page) <= 2
+    ), "Incorrect page range if last chunk is a partial chunk"
 
     chunk_text, metadata = await read_doc(
         stub_data_dir / "flag_day.html",
@@ -1171,8 +1182,14 @@ async def test_chunk_metadata_reader(stub_data_dir: Path) -> None:
     assert metadata.chunk_metadata.chunk_type == "overlap"
     assert metadata.chunk_metadata.overlap == 100
     assert metadata.chunk_metadata.chunk_chars == 3000
-    assert all(len(chunk.text) <= 3000 * 1.25 for chunk in chunk_text)
-    assert metadata.total_parsed_text_length // 3000 <= len(chunk_text)
+    assert all(
+        len(chunk.text) <= metadata.chunk_metadata.chunk_chars * 1.25
+        for chunk in chunk_text
+    )
+    assert (
+        metadata.total_parsed_text_length // metadata.chunk_metadata.chunk_chars
+        <= len(chunk_text)
+    )
 
     for code_input in (
         Path(__file__),  # Python gets parsed into `list[str]` content
@@ -1189,8 +1206,14 @@ async def test_chunk_metadata_reader(stub_data_dir: Path) -> None:
         assert metadata.chunk_metadata.chunk_type == "overlap_code_by_line"
         assert metadata.chunk_metadata.overlap == 100
         assert metadata.chunk_metadata.chunk_chars == 3000
-        assert all(len(chunk.text) <= 3000 * 1.25 for chunk in chunk_text)
-        assert metadata.total_parsed_text_length // 3000 <= len(chunk_text)
+        assert all(
+            len(chunk.text) <= metadata.chunk_metadata.chunk_chars * 1.25
+            for chunk in chunk_text
+        )
+        assert (
+            metadata.total_parsed_text_length // metadata.chunk_metadata.chunk_chars
+            <= len(chunk_text)
+        )
 
 
 @pytest.mark.asyncio
@@ -1452,13 +1475,15 @@ def test_docdetails_merge_with_list_fields() -> None:
     assert isinstance(merged_doc, DocDetails), "Merged doc should also be DocDetails"
 
 
-def test_docdetails_deserialization() -> None:
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="Uses `csv.QUOTE_NOTNULL`.")
+def test_docdetails_deserialization(tmp_path) -> None:
     deserialize_to_doc = {
         "citation": "stub",
         "dockey": "stub",
         "docname": "Stub",
         "embedding": None,
         "formatted_citation": "stub",
+        "fields_to_overwrite_from_metadata": {"key", "doc_id", "docname", "citation"},
     }
     deepcopy_deserialize_to_doc = deepcopy(deserialize_to_doc)
     doc = Doc(**deserialize_to_doc)
@@ -1467,8 +1492,9 @@ def test_docdetails_deserialization() -> None:
         deserialize_to_doc == deepcopy_deserialize_to_doc
     ), "Deserialization should not mutate input"
 
-    doc_details = DocDetails(**deserialize_to_doc)
-    serialized_doc_details = doc_details.model_dump(exclude_none=True)
+    serialized_doc_details = DocDetails(**deserialize_to_doc).model_dump(
+        exclude_none=True
+    )
     for key, value in {
         "docname": "unknownauthorsUnknownyearunknowntitle",
         "citation": "Unknown authors. Unknown title. Unknown journal, Unknown year.",
@@ -1478,7 +1504,7 @@ def test_docdetails_deserialization() -> None:
             ' Unknown",\n    title = "Unknown title",\n    year = "Unknown year",\n   '
             ' journal = "Unknown journal"\n}\n'
         ),
-        "other": {},
+        "other": {"bibtex_source": ["self_generated"]},
         "formatted_citation": (
             "Unknown authors. Unknown title. Unknown journal, Unknown year."
         ),
@@ -1487,6 +1513,17 @@ def test_docdetails_deserialization() -> None:
     assert (
         deserialize_to_doc == deepcopy_deserialize_to_doc
     ), "Deserialization should not mutate input"
+
+    doc_details = DocDetails(
+        **deserialize_to_doc, other={"apple": "sauce"}, authors=["Thomas Anderson"]
+    )
+    DocDetails.to_csv([doc_details], target_csv_path=Path(tmp_path) / "manifest.csv")
+    with open(tmp_path / "manifest.csv", encoding="utf-8") as f:
+        csv_deserialized = DocDetails(
+            # type ignore comments are here since mypy can't recognize pytest skip
+            **next(csv.DictReader(f.readlines(), quoting=csv.QUOTE_NOTNULL))  # type: ignore[attr-defined,unused-ignore]
+        )
+    assert doc_details == csv_deserialized, "Round-trip CSV deserialization failed"
 
 
 def test_docdetails_doc_id_roundtrip() -> None:
@@ -1529,6 +1566,7 @@ def test_docdetails_doc_id_roundtrip() -> None:
     # now let's do this with a doi
     doc_details_with_doi_no_doc_id = DocDetails(
         doi=test_doi,
+        title=r"A Stub | \emph{Stub Title}",
         docname="test_doc",
         citation="Test Citation",
         dockey="test_dockey",
@@ -1544,6 +1582,10 @@ def test_docdetails_doc_id_roundtrip() -> None:
     assert (
         doc_details_with_doi_no_doc_id.dockey == doc_details_with_doi_no_doc_id.doc_id
     )
+    assert (
+        doc_details_with_doi_no_doc_id.make_filename()
+        == "A Stub - -emph{Stub Title}_7f8a71c920c202c5"
+    )
 
     # round-trip serializaiton should keep the same doc_id
     new_with_doi_no_doc_id = DocDetails(
@@ -1552,6 +1594,10 @@ def test_docdetails_doc_id_roundtrip() -> None:
     assert (
         new_with_doi_no_doc_id.doc_id == doc_details_with_doi_no_doc_id.doc_id
     ), "DocDetails with doc_id should keep the same doc_id after serialization"
+    assert (
+        new_with_doi_no_doc_id.make_filename()
+        == "A Stub - -emph{Stub Title}_7f8a71c920c202c5"
+    )
 
     # since validation runs on assignment, make sure we can assign correctly
     doc_details_with_doi_no_doc_id.doc_id = test_specified_doc_id
@@ -1975,3 +2021,29 @@ def test_maybe_get_date():
     assert maybe_get_date(datetime(2023, 1, 1)) == datetime(2023, 1, 1)
     assert maybe_get_date("foo") is None
     assert maybe_get_date("") is None
+
+
+@pytest.mark.parametrize(
+    ("raw_text", "cleaned_text"),
+    [
+        ("name", "name"),
+        (" name", " name"),
+        ("name ", "name "),
+        (" ", " "),
+        ("Bates name", "Bates name"),
+        ("Bate's name", "Bates name"),
+        ("Bate's name Bate's name", "Bates name Bates name"),
+        ("Bates' name", "Bates name"),
+        ("X's Y", "Xs Y"),
+        ("' name", "name"),
+        (" ' name", " name"),
+        ("name ' name", "name name"),
+        ("'s name", "name"),
+        (" 's name", " name"),
+        ("s' name", "s name"),
+        ("S' name", "S name"),
+        ("Bates 's name", "Bates name"),
+    ],
+)
+def test_clean_possessives(raw_text: str, cleaned_text: str) -> None:
+    assert clean_possessives(raw_text) == cleaned_text

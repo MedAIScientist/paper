@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import ast
+import csv
 import logging
 import os
 import re
 import warnings
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from copy import deepcopy
 from datetime import datetime
-from typing import Any, ClassVar, cast
+from enum import StrEnum
+from typing import Annotated, Any, ClassVar, Self, cast
 from uuid import UUID, uuid4
 
 import tiktoken
@@ -20,6 +23,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PlainSerializer,
     computed_field,
     field_validator,
     model_validator,
@@ -29,7 +33,7 @@ from paperqa.utils import (
     create_bibtex_key,
     encode_id,
     format_bibtex,
-    get_citenames,
+    get_citation_ids,
     maybe_get_date,
 )
 from paperqa.version import __version__ as pqa_version
@@ -58,9 +62,12 @@ class Doc(Embeddable):
     docname: str
     dockey: DocKey
     citation: str
-    fields_to_overwrite_from_metadata: set[str] = Field(
-        default_factory=lambda: set(DEFAULT_FIELDS_TO_OVERWRITE_FROM_METADATA),
-        description="fields from metadata to overwrite when upgrading to a DocDetails",
+    # Sort the serialization to minimize the diff of serialized objects
+    fields_to_overwrite_from_metadata: Annotated[set[str], PlainSerializer(sorted)] = (
+        Field(
+            default_factory=lambda: set(DEFAULT_FIELDS_TO_OVERWRITE_FROM_METADATA),
+            description="fields from metadata to overwrite when upgrading to a DocDetails",
+        )
     )
 
     @model_validator(mode="before")
@@ -94,20 +101,78 @@ class Doc(Embeddable):
                 return False
         return True
 
+    FIELDS_TO_EXCLUDE_FROM_CSV: ClassVar[set[str]] = {
+        "embedding",  # Don't store to allow for configuration of embedding models
+    }
+    CSV_FIELDS_UP_FRONT: ClassVar[Sequence[str]] = ()
+
+    @classmethod
+    def to_csv(cls, values: Iterable[Self], target_csv_path: str | os.PathLike) -> None:
+        """Dump many instances into a CSV, for later use as a manifest."""
+        headers = set(cls.model_fields) - cls.FIELDS_TO_EXCLUDE_FROM_CSV
+        with open(target_csv_path, "w", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    *sorted(cls.CSV_FIELDS_UP_FRONT),  # Make easy reading
+                    *sorted(headers - set(cls.CSV_FIELDS_UP_FRONT)),
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(
+                [
+                    v.model_dump(
+                        exclude={"formatted_citation"} | cls.FIELDS_TO_EXCLUDE_FROM_CSV
+                    )
+                    for v in values
+                ]
+            )
+
 
 class Text(Embeddable):
-    text: str
-    name: str
-    doc: Doc | DocDetails = Field(union_mode="left_to_right")
+    """A text chunk ready for use in retrieval with a linked document."""
+
+    text: str = Field(description="Processed text content of the chunk.")
+    name: str = Field(
+        description=(
+            "Human-readable identifier for the chunk"
+            " (e.g., 'Wiki2023 chunk 1', 'sentence1')."
+        )
+    )
+    doc: Doc | DocDetails = Field(
+        union_mode="left_to_right",
+        description="Source document this text chunk originates from.",
+    )
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, type(self)):
+            return NotImplemented
+        # We ignore the embedding since the embedding can:
+        # - Be lazily acquired, or not used (depending on settings)
+        # - Get ditched when serializing a text for an HTTP request
+        return (
+            self.name == other.name
+            and self.text == other.text
+            and self.doc == other.doc
+        )
 
     def __hash__(self) -> int:
-        return hash(self.text)
+        return hash((self.name, self.text))
+
+
+# Sentinel to autopopulate a field within model_validator
+AUTOPOPULATE_VALUE = ""  # NOTE: this is falsy by design
 
 
 class Context(BaseModel):
     """A class to hold the context of a question."""
 
     model_config = ConfigDict(extra="allow")
+
+    id: str = Field(
+        default=AUTOPOPULATE_VALUE,
+        description="Unique identifier for the context. Auto-generated if not provided.",
+    )
 
     context: str = Field(description="Summary of the text with respect to a question.")
     question: str | None = Field(
@@ -120,9 +185,29 @@ class Context(BaseModel):
     text: Text
     score: int = 5
 
+    CONTEXT_ENCODING_LENGTH: ClassVar[int] = 500  # chars
+    ID_HASH_LENGTH: ClassVar[int] = 8  # chars
+    # pqac stands for "paper qa context"
+    REFERENCE_TEMPLATE: ClassVar[str] = "pqac-{id}"
+
     def __str__(self) -> str:
         """Return the context as a string."""
         return self.context
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_id(cls, data: dict[str, Any]) -> dict[str, Any]:
+        if not data.get("id"):  # NOTE: this includes missing or empty strings
+            content = (
+                data.get("question", "")
+                + data.get("context", "")[: cls.CONTEXT_ENCODING_LENGTH]
+            )
+            return data | {  # Avoid mutating input data
+                "id": cls.REFERENCE_TEMPLATE.format(
+                    id=encode_id(content or str(uuid4()), maxsize=cls.ID_HASH_LENGTH)
+                )
+            }
+        return data
 
 
 class PQASession(BaseModel):
@@ -133,6 +218,10 @@ class PQASession(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     question: str
     answer: str = ""
+    raw_answer: str = Field(
+        default="",
+        description="Raw answer from the LLM, including context IDs.",
+    )
     answer_reasoning: str | None = Field(
         default=None,
         description=(
@@ -198,7 +287,7 @@ class PQASession(BaseModel):
     @property
     def used_contexts(self) -> set[str]:
         """Return the used contexts."""
-        return get_citenames(self.formatted_answer)
+        return {c.id for c in self.contexts if c.id in self.raw_answer}
 
     def get_citation(self, name: str) -> str:
         """Return the formatted citation for the given docname."""
@@ -239,20 +328,82 @@ class PQASession(BaseModel):
         }
 
     def filter_content_for_user(self) -> None:
-        """Filter out extra items (inplace) that do not need to be returned to the user."""
+        """
+        In-place filter/drop items that are irrelevant to the user.
+
+        This is mainly done to keep HTTP requests reasonably sized.
+        """
         self.contexts = [
             Context(
-                context=c.context,
-                question=c.question,
-                score=c.score,
+                # Dump all fields from the original context (including extras),
+                # but exclude 'text' so we can replace it below.
+                **c.model_dump(exclude={"text"}),
                 text=Text(
                     text="",
-                    **c.text.model_dump(exclude={"text", "embedding", "doc"}),
+                    # Similar to the explanation in `map_fxn_summary`'s internals
+                    # on why we drop embeddings, drop embeddings here too because
+                    # embeddings aren't displayed to front end users
                     doc=c.text.doc.model_dump(exclude={"embedding"}),
+                    **c.text.model_dump(exclude={"text", "embedding", "doc"}),
                 ),
             )
             for c in self.contexts
         ]
+
+    def populate_formatted_answers_and_bib_from_raw_answer(
+        self,
+    ) -> None:
+        """Format a raw answer for display, mutating the session in place."""
+        formatted_without_references = self.raw_answer
+
+        id_to_name_map = {c.id: c.text.name for c in self.contexts}
+        name_to_citation_map = {
+            c.text.name: c.text.doc.formatted_citation for c in self.contexts
+        }
+        name_bib = {}
+
+        # https://regex101.com/r/h2Ca20/1
+        for parenthetical in re.findall(r"\(([^)]*)\)", formatted_without_references):
+
+            # now we replace eligible parentheticals with the deduped names
+            deduped_names = {
+                id_to_name_map.get(key, "") for key in get_citation_ids(parenthetical)
+            }
+
+            # replace the parenthetical with the deduped names
+            if deduped_names:
+                formatted_without_references = formatted_without_references.replace(
+                    parenthetical,
+                    f"{', '.join(deduped_names)}",
+                )
+                for deduped_name in deduped_names:
+                    if (
+                        deduped_name in name_to_citation_map
+                        and deduped_name not in name_bib
+                    ):
+                        name_bib[deduped_name] = name_to_citation_map[deduped_name]
+
+        bib = "\n\n".join(
+            [f"{i + 1}. ({k}): {c}" for i, (k, c) in enumerate(name_bib.items())]
+        )
+
+        # strip out any leftover hallucinated citations
+        included_keys = get_citation_ids(self.raw_answer)
+        for hallucinated_key in set(included_keys) - set(id_to_name_map):
+            formatted_without_references = formatted_without_references.replace(
+                hallucinated_key, ""
+            )
+
+        formatted_with_references = (
+            f"Question: {self.question}\n\n{formatted_without_references}"
+        )
+
+        if bib:
+            formatted_with_references += f"\n\nReferences\n\n{bib}\n"
+
+        self.answer = formatted_without_references
+        self.formatted_answer = formatted_with_references
+        self.references = bib
 
 
 # for backwards compatibility
@@ -286,10 +437,22 @@ class ParsedMetadata(BaseModel):
 
 
 class ParsedText(BaseModel):
-    """Parsed text (pre-chunking)."""
+    """All text from a document read, before chunking."""
 
-    content: dict | str | list[str]
-    metadata: ParsedMetadata
+    content: dict[str, str] | str | list[str] = Field(
+        description=(
+            "All parsed but not further processed (e.g. not chunked) contents from a"
+            " document. It may be structured, depending on the parser's implementation."
+            " Thus it can take various shapes depending on the document type"
+            " (e.g. PDF, HTML) and parser:"
+            "\n- `dict[str, str]` (e.g. page number -> page text) for PDFs."
+            "\n- `str` for text files."
+            "\n- `list[str]` for line-by-line parsings."
+        )
+    )
+    metadata: ParsedMetadata = Field(
+        description="Metadata on the parsing process used."
+    )
 
     def encode_content(self):
         # we tokenize using tiktoken so cuts are in reasonable places
@@ -311,6 +474,27 @@ class ParsedText(BaseModel):
         if isinstance(self.content, list):
             return "\n\n".join(self.content)
         return "\n\n".join(self.content.values())
+
+
+class BibTeXSource(StrEnum):
+    """Possible BibTeX sources."""
+
+    # This source is used when the BibTeX is incomplete or missing,
+    # and means we generated the BibTeX ourselves
+    SELF_GENERATED = "self_generated"
+    CROSSREF = "crossref"
+    SEMANTIC_SCHOLAR = "semantic_scholar"
+
+    def update_other(self, other: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Update an 'other' data dictionary to include this BibTeX source."""
+        if not other:
+            return {"bibtex_source": [self.value]}
+        if "bibtex_source" in other:
+            if self.value not in other["bibtex_source"]:
+                other["bibtex_source"].append(self.value)
+        else:
+            other["bibtex_source"] = [self.value]
+        return other
 
 
 # We use these integer values
@@ -339,9 +523,6 @@ JOURNAL_EXPECTED_DOI_LENGTHS = {
 
 class DocDetails(Doc):
     model_config = ConfigDict(validate_assignment=True, extra="ignore")
-
-    # Sentinel to auto-populate a field within model_validator
-    AUTOPOPULATE_VALUE: ClassVar[str] = ""
 
     docname: str = AUTOPOPULATE_VALUE
     dockey: DocKey = AUTOPOPULATE_VALUE
@@ -386,7 +567,13 @@ class DocDetails(Doc):
     )
     doi: str | None = None
     doi_url: str | None = None
-    doc_id: str | None = None
+    doc_id: str | None = Field(
+        default=None,
+        description=(
+            "Unique ID for this document. Simple ways to acquire one include"
+            " hashing the DOI or a stringifying a UUID."
+        ),
+    )
     file_location: str | os.PathLike | None = None
     license: str | None = Field(
         default=None,
@@ -407,6 +594,11 @@ class DocDetails(Doc):
         "http://dx.doi.org/",
     }
     AUTHOR_NAMES_TO_REMOVE: ClassVar[Collection[str]] = {"et al", "et al."}
+    FIELDS_TO_EXCLUDE_FROM_CSV: ClassVar[set[str]] = {
+        "bibtex",  # Let this be autogenerated, to avoid dealing with newlines
+        "embedding",  # Don't store to allow for configuration of embedding models
+    }
+    CSV_FIELDS_UP_FRONT: ClassVar[Sequence[str]] = ("doi", "file_location")
 
     @field_validator("key")
     @classmethod
@@ -467,7 +659,7 @@ class DocDetails(Doc):
     def misc_string_cleaning(data: dict[str, Any]) -> dict[str, Any]:
         """Clean strings before the enter the validation process."""
         if pages := data.get("pages"):
-            data["pages"] = pages.replace("--", "-").replace(" ", "")
+            data["pages"] = pages.replace("--", "-").replace(" ", "").strip()
         return data
 
     @staticmethod
@@ -541,9 +733,7 @@ class DocDetails(Doc):
         return data
 
     @classmethod
-    def populate_bibtex_key_citation(  # noqa: PLR0912
-        cls, data: dict[str, Any]
-    ) -> dict[str, Any]:
+    def populate_bibtex_key_citation(cls, data: dict[str, Any]) -> dict[str, Any]:
         """Add or modify bibtex, key, and citation fields.
 
         Missing values, 'unknown' keys, and incomplete bibtex entries are regenerated.
@@ -572,16 +762,9 @@ class DocDetails(Doc):
             existing_entry = None
             # if our bibtex already exists, but is incomplete, we add self_generated to metadata
             if data.get("bibtex"):
-                if data.get("other"):
-                    if (
-                        "bibtex_source" in data["other"]
-                        and "self_generated" not in data["other"]["bibtex_source"]
-                    ):
-                        data["other"]["bibtex_source"].append("self_generated")
-                    else:
-                        data["other"]["bibtex_source"] = ["self_generated"]
-                else:
-                    data["other"] = {"bibtex_source": ["self_generated"]}
+                data["other"] = BibTeXSource.SELF_GENERATED.update_other(
+                    data.get("other")
+                )
                 try:
                     existing_entry = next(
                         iter(Parser().parse_string(data["bibtex"]).entries.values())
@@ -625,6 +808,11 @@ class DocDetails(Doc):
                 data["bibtex"] = BibliographyData(
                     entries={data["key"]: new_entry}
                 ).to_string("bibtex")
+                # We consider the source self-generated because the 'key' gets
+                # autogenerated above via `create_bibtex_key` if it wasn't present
+                data["other"] = BibTeXSource.SELF_GENERATED.update_other(
+                    data.get("other")
+                )
                 # clear out the citation, since it will be regenerated
                 if "citation" in data.get(
                     "fields_to_overwrite_from_metadata",
@@ -651,10 +839,18 @@ class DocDetails(Doc):
         data = deepcopy(data)  # Avoid mutating input
         data = dict(data)
         if isinstance(data.get("fields_to_overwrite_from_metadata"), str):
+            raw_value = data["fields_to_overwrite_from_metadata"]
+            if (raw_value[0], raw_value[-1]) in {("[", "]"), ("{", "}")}:
+                # If string-ified set or list, remove brackets before split
+                raw_value = raw_value[1:-1]
             data["fields_to_overwrite_from_metadata"] = {
-                s.strip()
-                for s in data.get("fields_to_overwrite_from_metadata", "").split(",")
+                s.strip("\"' ") for s in raw_value.split(",")
             }
+        for possibly_str_field in ("authors", "other"):
+            if data.get(possibly_str_field) and isinstance(
+                data[possibly_str_field], str
+            ):
+                data[possibly_str_field] = ast.literal_eval(data[possibly_str_field])
         data = cls.lowercase_doi_and_populate_doc_id(data)
         data = cls.remove_invalid_authors(data)
         data = cls.misc_string_cleaning(data)
@@ -669,6 +865,29 @@ class DocDetails(Doc):
             return getattr(self, item)
         except AttributeError:
             return self.other[item]
+
+    def make_filename(self, title_limit: int | None = 48) -> str:
+        """
+        Make a filesystem-safe filename that has the doc ID appended, but no extension.
+
+        Args:
+            title_limit: Character limit on the title.
+
+        Returns:
+            Filename that is filesystem safe (e.g. non-safe chars are replaced with dash).
+        """
+        if not self.title or not self.doc_id:
+            raise ValueError("Unable to create filename without both title and doc_id.")
+        # SEE: https://stackoverflow.com/a/71199182
+        encoded_title = re.sub(
+            r"[/\\?%*:|\"<>\x7F\x00-\x1F]", "-", self.title[:title_limit]
+        )
+        # NOTE: we append the doc ID for a few reasons:
+        # 1. Prevent collisions for identical titles
+        #    SEE: https://stackoverflow.com/a/71761675
+        # 2. Filenames shouldn't end in a period,
+        #    so append the doc ID to circumvent that gotcha
+        return "_".join((encoded_title, self.doc_id))
 
     @computed_field  # type: ignore[prop-decorator]
     @property

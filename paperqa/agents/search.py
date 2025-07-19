@@ -8,14 +8,13 @@ import os
 import pathlib
 import pickle
 import re
+import sys
 import warnings
 import zlib
 from collections import Counter
 from collections.abc import AsyncIterator, Callable, Sequence
-from datetime import datetime
 from enum import StrEnum, auto
 from typing import TYPE_CHECKING, Any, ClassVar
-from uuid import UUID
 
 import anyio
 from pydantic import BaseModel
@@ -46,7 +45,7 @@ from tenacity import (
 from paperqa.docs import Docs
 from paperqa.settings import IndexSettings, get_settings
 from paperqa.types import VAR_MATCH_LOOKUP, DocDetails
-from paperqa.utils import ImpossibleParsingError, hexdigest
+from paperqa.utils import ImpossibleParsingError, clean_possessives, hexdigest
 
 from .models import JSONType, SupportsPickle
 
@@ -60,22 +59,6 @@ logger = logging.getLogger(__name__)
 
 class AsyncRetryError(Exception):
     """Flags a retry for another tenacity attempt."""
-
-
-class RobustEncoder(json.JSONEncoder):
-    """JSON encoder that can handle UUID and set objects."""
-
-    def default(self, o):
-        if isinstance(o, UUID):
-            # if the obj is uuid, we simply return the value of uuid
-            return str(o)
-        if isinstance(o, set):
-            return list(o)
-        if isinstance(o, os.PathLike):
-            return str(o)
-        if isinstance(o, datetime):
-            return o.isoformat()
-        return json.JSONEncoder.default(self, o)
 
 
 class SearchDocumentStorage(StrEnum):
@@ -95,7 +78,7 @@ class SearchDocumentStorage(StrEnum):
     def write_to_string(self, data: BaseModel | SupportsPickle) -> bytes:
         if self == SearchDocumentStorage.JSON_MODEL_DUMP:
             if isinstance(data, BaseModel):
-                return json.dumps(data.model_dump(), cls=RobustEncoder).encode("utf-8")
+                return data.model_dump_json().encode("utf-8")
             raise ValueError("JSON_MODEL_DUMP requires a BaseModel object.")
         if self == SearchDocumentStorage.PICKLE_COMPRESSED:
             return zlib.compress(pickle.dumps(data))
@@ -408,9 +391,8 @@ class SearchIndex:
                 return self.storage.read_from_string(content)
         return None
 
-    def clean_query(self, query: str) -> str:
-        # SEE: https://regex101.com/r/DoLMoa/3
-        return re.sub(r'[*\[\]:(){}~^><+"\\]', "", query)
+    # Remove these characters, SEE: https://regex101.com/r/DoLMoa/3
+    CLEAN_QUERY_REGEX: ClassVar[re.Pattern] = re.compile(r'[*\[\]:(){}~^><+"\\]')
 
     async def query(
         self,
@@ -424,13 +406,17 @@ class SearchIndex:
         query_fields = list(field_subset or self.fields)
         searcher = await self.searcher
         index = await self.index
+        cleaned_query = self.CLEAN_QUERY_REGEX.sub("", query)
+        try:
+            parsed_query = index.parse_query(cleaned_query, query_fields)
+        except ValueError:  # Rejected by tantivy
+            # Retry with more aggressive cleaning
+            parsed_query = index.parse_query(
+                clean_possessives(cleaned_query), query_fields
+            )
         addresses = [
             s[1]
-            for s in searcher.search(
-                index.parse_query(self.clean_query(query), query_fields),
-                top_n,
-                offset=offset,
-            ).hits
+            for s in searcher.search(parsed_query, top_n, offset=offset).hits
             if s[0] > min_score
         ]
         search_index_docs = [searcher.doc(address) for address in addresses]
@@ -466,9 +452,12 @@ async def maybe_get_manifest(
         try:
             async with await anyio.open_file(filename, mode="r") as file:
                 content = await file.read()
+            reader_kwargs: dict[str, Any] = {}
+            if sys.version_info >= (3, 12):  # Unlocks `bool | None` fields
+                reader_kwargs["quoting"] = csv.QUOTE_NOTNULL
             file_loc_to_records = {
                 str(r.get("file_location")): r
-                for r in csv.DictReader(content.splitlines())
+                for r in csv.DictReader(content.splitlines(), **reader_kwargs)
                 if r.get("file_location")
             }
             if not file_loc_to_records:

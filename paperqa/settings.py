@@ -54,6 +54,11 @@ from paperqa.prompts import (
     summary_json_system_prompt,
     summary_prompt,
 )
+from paperqa.readers import (
+    PDFParserFn,
+    parse_pdf_to_pages,
+    setup_pymupdf_python_logging,
+)
 from paperqa.utils import hexdigest, pqa_directory
 from paperqa.version import __version__
 
@@ -93,7 +98,8 @@ class AnswerSettings(BaseModel):
         ),
     )
     answer_length: str = Field(
-        "about 200 words, but can be longer", description="Length of final answer."
+        default="about 200 words, but can be longer",
+        description="Length of final answer.",
     )
     max_concurrent_requests: int = Field(
         default=4, description="Max concurrent requests to LLMs."
@@ -151,7 +157,7 @@ class ChunkingOptions(StrEnum):
 class ParsingSettings(BaseModel):
     """Settings relevant for parsing and chunking documents."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     chunk_size: int = Field(
         default=5000,
@@ -201,6 +207,17 @@ class ParsingSettings(BaseModel):
             "Whether to embed documents immediately as they are added, or defer until"
             " summarization."
         ),
+    )
+    parse_pdf: PDFParserFn = Field(
+        default=parse_pdf_to_pages, description="Function to parse PDF.", exclude=True
+    )
+    configure_pdf_parser: Callable[[], Any] = Field(
+        default=setup_pymupdf_python_logging,
+        description=(
+            "Callable to configure the PDF parser within parse_pdf,"
+            " useful for behaviors such as enabling logging."
+        ),
+        exclude=True,
     )
     chunking_algorithm: ChunkingOptions = ChunkingOptions.SIMPLE_OVERLAP
     doc_filters: Sequence[Mapping[str, Any]] | None = Field(
@@ -268,8 +285,10 @@ def get_formatted_variables(s: str) -> set[str]:
 class PromptSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    # MLA parenthetical in-text citation, SEE: https://nwtc.libguides.com/citations/MLA#s-lg-box-707489
-    EXAMPLE_CITATION: ClassVar[str] = "(Example2012Example pages 3-4)"
+    # citations are inserted with Context.id as follows,
+    # these are translated to MLA parenthetical in-text citation styling
+    # SEE: https://nwtc.libguides.com/citations/MLA#s-lg-box-707489
+    EXAMPLE_CITATION: ClassVar[str] = "(pqac-0f650d59)"
 
     summary: str = summary_prompt
     qa: str = qa_prompt

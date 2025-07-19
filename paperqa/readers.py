@@ -4,7 +4,7 @@ import asyncio
 import os
 from math import ceil
 from pathlib import Path
-from typing import Literal, cast, overload
+from typing import Literal, Protocol, cast, overload, runtime_checkable
 
 import pymupdf
 import tiktoken
@@ -21,6 +21,25 @@ from paperqa.types import (
 from paperqa.utils import ImpossibleParsingError
 from paperqa.version import __version__ as pqa_version
 
+
+def setup_pymupdf_python_logging() -> None:
+    """
+    Configure PyMuPDF to use Python logging.
+
+    SEE: https://pymupdf.readthedocs.io/en/latest/app3.html#diagnostics
+    """
+    pymupdf.set_messages(pylogging=True)
+
+
+@runtime_checkable
+class PDFParserFn(Protocol):
+    """Protocol for parsing a PDF."""
+
+    def __call__(
+        self, path: str | os.PathLike, page_size_limit: int | None = None, **kwargs
+    ) -> ParsedText: ...
+
+
 BLOCK_TEXT_INDEX = 4
 
 
@@ -28,6 +47,7 @@ def parse_pdf_to_pages(
     path: str | os.PathLike,
     page_size_limit: int | None = None,
     use_block_parsing: bool = False,
+    **_,
 ) -> ParsedText:
 
     with pymupdf.open(path) as file:
@@ -129,6 +149,7 @@ def parse_text(
     split_lines: bool = False,
     use_tiktoken: bool = True,
     page_size_limit: int | None = None,
+    **_,
 ) -> ParsedText:
     """Simple text splitter, can optionally use tiktoken, parse html, or split into newlines.
 
@@ -289,6 +310,7 @@ async def read_doc(
     include_metadata: Literal[True],
     chunk_chars: int = ...,
     overlap: int = ...,
+    parse_pdf: PDFParserFn | None = ...,
     **parser_kwargs,
 ) -> ParsedText: ...
 @overload
@@ -299,6 +321,7 @@ async def read_doc(
     include_metadata: Literal[False] = ...,
     chunk_chars: int = ...,
     overlap: int = ...,
+    parse_pdf: PDFParserFn | None = ...,
     **parser_kwargs,
 ) -> ParsedText: ...
 @overload
@@ -309,6 +332,7 @@ async def read_doc(
     include_metadata: Literal[True],
     chunk_chars: int = ...,
     overlap: int = ...,
+    parse_pdf: PDFParserFn | None = ...,
     **parser_kwargs,
 ) -> tuple[list[Text], ParsedMetadata]: ...
 @overload
@@ -319,6 +343,7 @@ async def read_doc(
     include_metadata: Literal[False] = ...,
     chunk_chars: int = ...,
     overlap: int = ...,
+    parse_pdf: PDFParserFn | None = ...,
     **parser_kwargs,
 ) -> list[Text]: ...
 @overload
@@ -329,6 +354,7 @@ async def read_doc(
     include_metadata: Literal[True],
     chunk_chars: int = ...,
     overlap: int = ...,
+    parse_pdf: PDFParserFn | None = ...,
     **parser_kwargs,
 ) -> tuple[list[Text], ParsedMetadata]: ...
 async def read_doc(
@@ -338,6 +364,7 @@ async def read_doc(
     include_metadata: bool = False,
     chunk_chars: int = 3000,
     overlap: int = 100,
+    parse_pdf: PDFParserFn | None = None,
     **parser_kwargs,
 ) -> list[Text] | ParsedText | tuple[list[Text], ParsedMetadata]:
     """Parse a document and split into chunks.
@@ -350,25 +377,26 @@ async def read_doc(
         include_metadata: return a tuple
         chunk_chars: size of chunks
         overlap: size of overlap between chunks
+        parse_pdf: Optional function to parse PDF files (if you're parsing a PDF).
         parser_kwargs: Keyword arguments to pass to the used parsing function.
     """
     str_path = str(path)
 
     # start with parsing -- users may want to store this separately
     if str_path.endswith(".pdf"):
-        # pymupdf is not thread-safe per docs here: https://pymupdf.readthedocs.io/en/latest/recipes-multiprocessing.html
-        parsed_text = parse_pdf_to_pages(path, **parser_kwargs)
+        if parse_pdf is None:
+            raise ValueError("When parsing a PDF, a parsing function must be provided.")
+        # Some PDF parsers are not thread-safe,
+        # so can't use multithreading via `asyncio.to_thread` here
+        parsed_text: ParsedText = parse_pdf(path, **parser_kwargs)
     elif str_path.endswith(".txt"):
         # TODO: Make parse_text async
-        parser_kwargs.pop("use_block_parsing", None)  # Not a parse_text kwarg
         parsed_text = await asyncio.to_thread(parse_text, path, **parser_kwargs)
     elif str_path.endswith(".html"):
-        parser_kwargs.pop("use_block_parsing", None)  # Not a parse_text kwarg
         parsed_text = await asyncio.to_thread(
             parse_text, path, html=True, **parser_kwargs
         )
     else:
-        parser_kwargs.pop("use_block_parsing", None)  # Not a parse_text kwarg
         parsed_text = await asyncio.to_thread(
             parse_text, path, split_lines=True, use_tiktoken=False, **parser_kwargs
         )

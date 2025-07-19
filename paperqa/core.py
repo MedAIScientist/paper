@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from collections.abc import Callable, Sequence
@@ -87,7 +88,9 @@ def llm_parse_json(text: str) -> dict:
     except json.JSONDecodeError as e:
         # If normal parsing fails, try to handle nested quotes case
         if "summary" in ptext and '"relevance_score"' in ptext:
-            try:
+            with contextlib.suppress(
+                Exception  # Continue to the standard error if regex approach fails
+            ):
                 # Extract summary and relevance_score directly using regex
                 summary_match = re.search(
                     r'"summary"\s*:\s*"(.*?)",\s*"relevance_score"', ptext, re.DOTALL
@@ -99,9 +102,6 @@ def llm_parse_json(text: str) -> dict:
                         "summary": summary_match.group(1).replace(r"\'", "'"),
                         "relevance_score": int(score_match.group(1)),
                     }
-            except Exception:  # noqa: S110
-                # Continue to the standard error if regex approach fails
-                pass
 
         raise ValueError(
             f"Failed to parse JSON from text {text!r}. Your model may not be capable of"
@@ -163,9 +163,13 @@ async def map_fxn_summary(
     success = False
 
     if summary_llm_model and prompt_templates:
-        data = {"question": question, "citation": citation, "text": text.text} | (
-            extra_prompt_data or {}
-        )
+        data = {
+            "question": question,
+            "citation": citation,
+            # Strip newlines in case chunking led to blank lines,
+            # but not spaces, to preserve text alignment
+            "text": text.text.strip("\n"),
+        } | (extra_prompt_data or {})
         message_prompt, system_prompt = prompt_templates
         messages = [
             Message(role="system", content=system_prompt.format(**data)),
@@ -193,7 +197,9 @@ async def map_fxn_summary(
             except KeyError:
                 success = False
     else:
-        context = text.text
+        # Strip newlines in case chunking led to blank lines,
+        # but not spaces, to preserve text alignment
+        context = text.text.strip("\n")
         # If we don't assign scores, just default to 5.
         # why 5? Because we filter out 0s in another place
         # and 5/10 is the other default I could come up with
@@ -209,9 +215,12 @@ async def map_fxn_summary(
             context=context,
             question=question,
             text=Text(
-                text=text.text,
-                name=text.name,
+                # Embeddings enable the retrieval of Texts to make Contexts.
+                # Once we already have Contexts, we filter them by score
+                # (and not the underlying Text's embeddings),
+                # so embeddings can be safely dropped from the deepcopy
                 doc=text.doc.model_dump(exclude={"embedding"}),
+                **text.model_dump(exclude={"embedding", "doc"}),
             ),
             score=score,  # pylint: disable=possibly-used-before-assignment
             **extras,
