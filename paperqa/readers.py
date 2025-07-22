@@ -82,6 +82,25 @@ def parse_pdf_to_pages(
             else:
                 text = page.get_text("text", sort=True)
 
+
+            if use_block_parsing:
+                # NOTE: this block-based parsing appears to be better, but until
+                # fully validated on 1+ benchmarks, it's considered experimental
+
+                # Extract text blocks from the page
+                # Note: sort=False is important to preserve the order of text blocks
+                # as they appear in the PDF
+                blocks = page.get_text("blocks", sort=False)
+
+                # Concatenate text blocks into a single string
+                text = "\n".join(
+                    block[BLOCK_TEXT_INDEX]
+                    for block in blocks
+                    if len(block) > BLOCK_TEXT_INDEX
+                )
+            else:
+                text = page.get_text("text", sort=True)
+
             if page_size_limit and len(text) > page_size_limit:
                 raise ImpossibleParsingError(
                     f"The text in page {i} of {file.page_count} was {len(text)} chars"
@@ -393,11 +412,15 @@ async def read_doc(
         # TODO: Make parse_text async
         parsed_text = await asyncio.to_thread(parse_text, path, **parser_kwargs)
     elif str_path.endswith(".html"):
+        parser_kwargs.pop("use_block_parsing", None)  # Not a parse_text kwarg
         parsed_text = await asyncio.to_thread(
+            parse_text, path, html=True, **parser_kwargs
             parse_text, path, html=True, **parser_kwargs
         )
     else:
+        parser_kwargs.pop("use_block_parsing", None)  # Not a parse_text kwarg
         parsed_text = await asyncio.to_thread(
+            parse_text, path, split_lines=True, use_tiktoken=False, **parser_kwargs
             parse_text, path, split_lines=True, use_tiktoken=False, **parser_kwargs
         )
 
